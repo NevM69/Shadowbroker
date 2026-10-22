@@ -1,0 +1,2037 @@
+diff --git a/backend/data/snapmap_zones.example.json b/backend/data/snapmap_zones.example.json
+new file mode 100644
+index 0000000..3fd4e54
+--- /dev/null
++++ b/backend/data/snapmap_zones.example.json
+@@ -0,0 +1,31 @@
++{
++  "_comment": "Copier en snapmap_zones.json. Zones de veille Snap Map : rayon 500 m à 85 km, 40 zones max. Une zone = un lieu à surveiller (site, axe, événement), jamais une personne.",
++  "zones": [
++    {
++      "id": "geneve-gare",
++      "label": "Genève — Gare Cornavin",
++      "lat": 46.2102,
++      "lon": 6.1424,
++      "radius_m": 1500,
++      "category": "infrastructure",
++      "keywords": ["gare", "cornavin", "évacuation"]
++    },
++    {
++      "id": "bale-frontiere",
++      "label": "Bâle — zone frontière FR/DE/CH",
++      "lat": 47.5896,
++      "lon": 7.5886,
++      "radius_m": 5000,
++      "category": "frontière"
++    },
++    {
++      "id": "paris-concorde",
++      "label": "Paris — Concorde / Assemblée",
++      "lat": 48.8656,
++      "lon": 2.3212,
++      "radius_m": 2000,
++      "category": "événement",
++      "keywords": ["manifestation", "assemblée"]
++    }
++  ]
++}
+diff --git a/backend/main.py b/backend/main.py
+index 1439d0a..a255546 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -402,6 +402,7 @@ if _MESH_ONLY:
+     scm_router = APIRouter()
+     entity_graph_router = APIRouter()
+     intel_feeds_router = APIRouter()
++    snapmap_router = APIRouter()
+     analytics_router = APIRouter()
+     agent_shell_router = APIRouter()
+ else:
+@@ -418,6 +419,7 @@ else:
+     scm_router = _load_optional_router("routers.scm")
+     entity_graph_router = _load_optional_router("routers.entity_graph")
+     intel_feeds_router = _load_optional_router("routers.intel_feeds")
++    snapmap_router = _load_optional_router("routers.snapmap")
+     analytics_router = _load_optional_router("routers.analytics")
+     agent_shell_router = _load_optional_router("routers.agent_shell")
+ 
+@@ -3866,6 +3868,7 @@ app.include_router(osint_router)
+ app.include_router(scm_router)
+ app.include_router(entity_graph_router)
+ app.include_router(intel_feeds_router)
++app.include_router(snapmap_router)
+ app.include_router(analytics_router)
+ app.include_router(agent_shell_router)
+ 
+diff --git a/backend/routers/data.py b/backend/routers/data.py
+index 5dff773..2688dbf 100644
+--- a/backend/routers/data.py
++++ b/backend/routers/data.py
+@@ -1006,7 +1006,7 @@ async def live_data_slow(
+             "scanners", "weather_alerts", "ukraine_alerts", "air_quality", "volcanoes",
+             "fishing_activity", "psk_reporter", "correlations", "uap_sightings", "wastewater",
+             "crowdthreat", "threat_level", "trending_markets", "road_corridor_trends",
+-            "malware_threats", "cyber_threats", "scm_suppliers", "telegram_osint", "gt_risk",
++            "malware_threats", "cyber_threats", "scm_suppliers", "telegram_osint", "snapmap_osint", "gt_risk",
+         )
+         freshness = get_source_timestamps_snapshot()
+         payload = {
+@@ -1072,6 +1072,11 @@ async def live_data_slow(
+             )
+             if active_layers.get("telegram_osint", True)
+             else {"posts": [], "total": 0, "geolocated": 0},
++            "snapmap_osint": (
++                d.get("snapmap_osint") or {"zones": [], "alerts": [], "total_zones": 0, "anomalies": 0}
++            )
++            if active_layers.get("snapmap_osint", False)
++            else {"zones": [], "alerts": [], "total_zones": 0, "anomalies": 0},
+             "gt_risk": (
+                 d.get("gt_risk")
+                 or {"enabled": False, "heatmap": {"type": "FeatureCollection", "features": []}, "clusters": []}
+diff --git a/backend/routers/snapmap.py b/backend/routers/snapmap.py
+new file mode 100644
+index 0000000..1817e60
+--- /dev/null
++++ b/backend/routers/snapmap.py
+@@ -0,0 +1,120 @@
++"""Snap Map OSINT — feed, watch-zone management, analyst confirmation, media proxy."""
++from __future__ import annotations
++
++import asyncio
++import logging
++from typing import Any
++from urllib.parse import urlparse
++
++import requests
++from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
++from fastapi.responses import StreamingResponse
++from starlette.background import BackgroundTask
++
++from auth import require_local_operator
++from limiter import limiter
++from services.fetchers._store import get_latest_data_subset_refs
++from services.fetchers.snapmap_osint import (
++    MAX_RADIUS_M,
++    MAX_ZONES,
++    MIN_RADIUS_M,
++    confirm_alert,
++    list_alerts,
++    load_zones,
++    save_zones,
++    snap_media_host_allowed,
++)
++from services.network_utils import outbound_user_agent
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter()
++
++_EMPTY = {"zones": [], "alerts": [], "total_zones": 0, "anomalies": 0, "timestamp": None}
++
++
++@router.get("/api/snapmap-feed")
++@limiter.limit("30/minute")
++async def snapmap_feed(request: Request) -> dict:
++    snap = get_latest_data_subset_refs("snapmap_osint")
++    payload = snap.get("snapmap_osint")
++    if not isinstance(payload, dict) or payload.get("zones") is None:
++        return dict(_EMPTY)
++    return payload
++
++
++@router.get("/api/snapmap/zones", dependencies=[Depends(require_local_operator)])
++@limiter.limit("30/minute")
++async def snapmap_zones(request: Request) -> dict:
++    return {
++        "zones": load_zones(),
++        "limits": {"min_radius_m": MIN_RADIUS_M, "max_radius_m": MAX_RADIUS_M, "max_zones": MAX_ZONES},
++    }
++
++
++@router.put("/api/snapmap/zones", dependencies=[Depends(require_local_operator)])
++@limiter.limit("10/minute")
++async def snapmap_zones_replace(request: Request, body: dict[str, Any] = Body(...)) -> dict:
++    """Replace the watch-zone list. Guardrails (radius, count) are enforced server-side."""
++    raw = body.get("zones")
++    if not isinstance(raw, list):
++        raise HTTPException(status_code=400, detail="Body must be {\"zones\": [...]}")
++    zones = await asyncio.to_thread(save_zones, raw)
++    return {"zones": zones, "accepted": len(zones), "submitted": len(raw)}
++
++
++@router.get("/api/snapmap/alerts", dependencies=[Depends(require_local_operator)])
++@limiter.limit("30/minute")
++async def snapmap_alerts(request: Request, limit: int = Query(default=50, ge=1, le=500)) -> dict:
++    return {"alerts": await asyncio.to_thread(list_alerts, limit)}
++
++
++@router.post("/api/snapmap/alerts/{alert_id}/confirm", dependencies=[Depends(require_local_operator)])
++@limiter.limit("20/minute")
++async def snapmap_alert_confirm(request: Request, alert_id: int, body: dict[str, Any] = Body(default={})) -> dict:
++    """Analyst confirmation after manual verification — upgrades the alert to reliability A."""
++    note = str((body or {}).get("note") or "").strip()
++    if not note:
++        raise HTTPException(status_code=400, detail="A verification note is required to rate an alert A")
++    alert = await asyncio.to_thread(confirm_alert, alert_id, note)
++    if not alert:
++        raise HTTPException(status_code=404, detail="Alert not found")
++    return alert
++
++
++@router.get("/api/snapmap/media")
++@limiter.limit("60/minute")
++async def snapmap_media_proxy(request: Request, url: str = Query(...)) -> StreamingResponse:
++    """Stream Snap CDN media for in-app viewing (host allowlist, no redirects)."""
++    parsed = urlparse(url)
++    if parsed.scheme != "https":
++        raise HTTPException(status_code=400, detail="Invalid scheme")
++    if not snap_media_host_allowed(parsed.hostname):
++        raise HTTPException(status_code=403, detail="Host not allowed")
++
++    headers = {
++        "User-Agent": f"Mozilla/5.0 (compatible; {outbound_user_agent('snapmap-media')})",
++        "Accept": "*/*",
++    }
++    if range_header := request.headers.get("range"):
++        headers["Range"] = range_header
++    try:
++        resp = requests.get(url, stream=True, timeout=(3, 45), headers=headers, allow_redirects=False)
++    except requests.RequestException as exc:
++        logger.warning("Snap media upstream failure: %s", exc)
++        raise HTTPException(status_code=502, detail="Upstream fetch failed") from exc
++    if resp.status_code >= 300:
++        resp.close()
++        raise HTTPException(status_code=502, detail=f"Upstream returned {resp.status_code}")
++
++    response_headers = {"Cache-Control": "private, max-age=300", "Accept-Ranges": resp.headers.get("Accept-Ranges", "bytes")}
++    for key in ("Content-Length", "Content-Range"):
++        if value := resp.headers.get(key):
++            response_headers[key] = value
++    return StreamingResponse(
++        resp.iter_content(chunk_size=65536),
++        status_code=resp.status_code,
++        media_type=resp.headers.get("Content-Type", "application/octet-stream"),
++        headers=response_headers,
++        background=BackgroundTask(resp.close),
++    )
+diff --git a/backend/services/data_fetcher.py b/backend/services/data_fetcher.py
+index 816ed7f..6a318fe 100644
+--- a/backend/services/data_fetcher.py
++++ b/backend/services/data_fetcher.py
+@@ -104,6 +104,7 @@ from services.fetchers.sar_catalog import fetch_sar_catalog  # noqa: F401
+ from services.fetchers.sar_products import fetch_sar_products  # noqa: F401
+ from services.fetchers.malware import fetch_malware_threats  # noqa: F401
+ from services.fetchers.telegram_osint import fetch_telegram_osint  # noqa: F401
++from services.fetchers.snapmap_osint import fetch_snapmap_osint, scan_interval_minutes as _snapmap_interval  # noqa: F401
+ from services.fetchers.cyber_status import fetch_cyber_threats  # noqa: F401
+ from services.scm.suppliers import fetch_scm_suppliers  # noqa: F401
+ from services.ais_stream import prune_stale_vessels  # noqa: F401
+@@ -837,6 +838,17 @@ def start_scheduler():
+         misfire_grace_time=600,
+     )
+ 
++    # Snap Map OSINT — watch-zone density scan (own cadence, min 10 min, default 15).
++    _scheduler.add_job(
++        lambda: _run_task_with_health(fetch_snapmap_osint, "fetch_snapmap_osint"),
++        "interval",
++        minutes=_snapmap_interval(),
++        next_run_time=datetime.utcnow() + timedelta(seconds=90),
++        id="snapmap_osint",
++        max_instances=1,
++        misfire_grace_time=600,
++    )
++
+     # Prediction markets — own jittered cadence (Polymarket/Kalshi clearnet egress).
+     # Kept off the fixed 5-minute slow tier so poll timing is less fingerprintable.
+     from services.fetchers.prediction_markets import fetch_prediction_markets
+diff --git a/backend/services/fetchers/_store.py b/backend/services/fetchers/_store.py
+index 20a9c43..a37481f 100644
+--- a/backend/services/fetchers/_store.py
++++ b/backend/services/fetchers/_store.py
+@@ -75,6 +75,7 @@ class DashboardData(TypedDict, total=False):
+     cyber_threats: Dict[str, Any]
+     scm_suppliers: Dict[str, Any]
+     telegram_osint: Dict[str, Any]
++    snapmap_osint: Dict[str, Any]
+     gt_risk: Dict[str, Any]
+ 
+ 
+@@ -131,6 +132,7 @@ latest_data: DashboardData = {
+     "cyber_threats": {"threats": [], "stats": {}},
+     "scm_suppliers": {"suppliers": [], "total": 0, "critical_count": 0},
+     "telegram_osint": {"posts": [], "total": 0, "geolocated": 0, "timestamp": None},
++    "snapmap_osint": {"zones": [], "alerts": [], "total_zones": 0, "anomalies": 0, "timestamp": None},
+     "gt_risk": {
+         "enabled": False,
+         "heatmap": {"type": "FeatureCollection", "features": []},
+@@ -502,6 +504,7 @@ active_layers: dict[str, bool] = {
+     "scm_suppliers": False,
+     "cyber_threats": False,
+     "telegram_osint": True,
++    "snapmap_osint": False,
+     "gt_risk": False,
+ }
+ 
+diff --git a/backend/services/fetchers/snapmap_osint.py b/backend/services/fetchers/snapmap_osint.py
+new file mode 100644
+index 0000000..3ea0418
+--- /dev/null
++++ b/backend/services/fetchers/snapmap_osint.py
+@@ -0,0 +1,766 @@
++"""Snap Map OSINT — public-activity density over operator-defined watch zones.
++
++What this layer does
++--------------------
++For each watch zone (AOI) configured by the operator, the fetcher asks the
++public Snap Map web endpoint (the same one map.snapchat.com uses) how many
++public snaps were posted around that point, compares the last-hour count with
++a rolling baseline for the same hour of the week, and flags anomalies
++("activity spike at 03:00 near site X").
++
++Design rules (privacy by design — do not relax without a legal review)
++---------------------------------------------------------------------
++* Zone-centric, never person-centric: there is no search by account, no
++  profile lookup, no face or identity processing.
++* No user identifiers are kept. Only snap id, timestamp, media type, media URL
++  and the locality title Snap itself shows are retained, in memory, for the
++  most recent items of a zone. The SQLite store only holds aggregate counts.
++* Minimum zone radius 500 m (no "single building" surveillance), max 85 km
++  (upstream limit), max 40 zones, minimum scan interval 10 minutes.
++* Media archiving is OFF by default. When enabled, only zones in alert are
++  archived and files are purged after a retention window.
++
++Reliability rating (A/B/C), consistent with OSINT source grading
++-----------------------------------------------------------------
++* C — Snap Map signal alone (density anomaly or normal reading).
++* B — anomaly corroborated by at least one independent Shadowbroker layer
++  (Telegram OSINT, news, GDELT, FIRMS fires) near the zone in the same window.
++* A — never automatic: set by an analyst through the confirm endpoint after
++  manual verification.
++
++Upstream notes
++--------------
++Endpoints are undocumented (``ms.sc-jpl.com/web/getLatestTileSet`` and
++``/web/getPlaylist``) and may change or rate-limit without notice; automated
++access is not permitted by Snap's terms. Keep the scan cadence conservative.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import math
++import os
++import re
++import sqlite3
++import threading
++import time
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from typing import Any, Iterable
++
++from services.fetchers._store import _data_lock, _mark_fresh, is_any_active, latest_data
++from services.network_utils import fetch_with_curl, outbound_user_agent
++
++logger = logging.getLogger(__name__)
++
++API_HOST = os.environ.get("SNAPMAP_API_HOST", "https://ms.sc-jpl.com").rstrip("/")
++
++MIN_RADIUS_M = 500
++MAX_RADIUS_M = 85_000
++MAX_ZONES = 40
++MIN_INTERVAL_MINUTES = 10
++MEDIA_PER_ZONE = 12
++READINGS_RETENTION_DAYS = 35
++BASELINE_DAYS = 28
++MIN_BASELINE_SAMPLES = 6
++CORROBORATION_WINDOW_H = 6
++CORROBORATION_EXTRA_KM = 10.0
++
++SNAP_MEDIA_HOST_SUFFIXES = (".sc-cdn.net",)
++
++_DATA_DIR = Path(os.environ.get("SB_DATA_DIR", str(Path(__file__).resolve().parents[2] / "data")))
++if not _DATA_DIR.is_absolute():
++    _DATA_DIR = Path(__file__).resolve().parents[2] / _DATA_DIR
++
++_DEFAULT_SECURITY_KEYWORDS = (
++    # FR
++    "incendie", "explosion", "manifestation", "manif", "émeute", "emeute", "police",
++    "gendarmerie", "pompiers", "attentat", "fusillade", "évacuation", "evacuation",
++    "accident", "drone", "alerte", "bouclage", "barrage",
++    # EN
++    "fire", "explosion", "protest", "riot", "police", "shooting", "evacuation",
++    "attack", "drone", "lockdown", "blast", "smoke",
++)
++
++_db_lock = threading.Lock()
++
++_EMPTY_PAYLOAD: dict[str, Any] = {
++    "zones": [],
++    "alerts": [],
++    "total_zones": 0,
++    "anomalies": 0,
++    "timestamp": None,
++}
++
++
++# ---------------------------------------------------------------------------
++# Configuration
++# ---------------------------------------------------------------------------
++def snapmap_osint_enabled() -> bool:
++    return str(os.environ.get("SNAPMAP_OSINT_ENABLED", "true")).strip().lower() not in {
++        "0", "false", "no", "off", "",
++    }
++
++
++def scan_interval_minutes() -> int:
++    try:
++        value = int(os.environ.get("SNAPMAP_OSINT_INTERVAL_MINUTES", "15"))
++    except ValueError:
++        value = 15
++    return max(MIN_INTERVAL_MINUTES, value)
++
++
++def archive_media_enabled() -> bool:
++    return str(os.environ.get("SNAPMAP_ARCHIVE_MEDIA", "false")).strip().lower() in {"1", "true", "yes", "on"}
++
++
++def archive_retention_hours() -> int:
++    try:
++        return max(1, int(os.environ.get("SNAPMAP_ARCHIVE_RETENTION_HOURS", "72")))
++    except ValueError:
++        return 72
++
++
++def zones_file() -> Path:
++    raw = os.environ.get("SNAPMAP_ZONES_FILE", "").strip()
++    return Path(raw) if raw else _DATA_DIR / "snapmap_zones.json"
++
++
++def db_path() -> Path:
++    raw = os.environ.get("SNAPMAP_DB_PATH", "").strip()
++    return Path(raw) if raw else _DATA_DIR / "snapmap_osint.db"
++
++
++def archive_dir() -> Path:
++    return _DATA_DIR / "snapmap_archive"
++
++
++def snap_media_host_allowed(hostname: str | None) -> bool:
++    host = str(hostname or "").strip().lower()
++    return bool(host) and any(host.endswith(suffix) for suffix in SNAP_MEDIA_HOST_SUFFIXES)
++
++
++_SLUG_RE = re.compile(r"[^a-z0-9_-]+")
++
++
++def normalize_zone(raw: dict[str, Any], index: int = 0) -> dict[str, Any] | None:
++    """Validate one zone and enforce guardrails. Returns None if unusable."""
++    try:
++        lat = float(raw.get("lat"))
++        lon = float(raw.get("lon", raw.get("lng")))
++    except (TypeError, ValueError):
++        return None
++    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
++        return None
++    if abs(lat) < 1e-6 and abs(lon) < 1e-6:
++        return None
++    try:
++        radius = int(float(raw.get("radius_m", 2000)))
++    except (TypeError, ValueError):
++        radius = 2000
++    radius = max(MIN_RADIUS_M, min(MAX_RADIUS_M, radius))
++
++    label = str(raw.get("label") or f"Zone {index + 1}").strip()[:80]
++    zone_id = _SLUG_RE.sub("-", str(raw.get("id") or label).strip().lower()).strip("-")[:48] or f"zone-{index + 1}"
++    keywords = raw.get("keywords") or []
++    if isinstance(keywords, str):
++        keywords = [k for k in keywords.split(",")]
++    keywords = [str(k).strip().lower() for k in keywords if str(k).strip()][:30]
++
++    return {
++        "id": zone_id,
++        "label": label,
++        "lat": round(lat, 6),
++        "lng": round(lon, 6),
++        "radius_m": radius,
++        "category": str(raw.get("category") or "veille").strip()[:40],
++        "keywords": keywords,
++    }
++
++
++def normalize_zones(raw_list: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
++    zones: list[dict[str, Any]] = []
++    seen: set[str] = set()
++    for i, raw in enumerate(raw_list or []):
++        if not isinstance(raw, dict):
++            continue
++        zone = normalize_zone(raw, i)
++        if not zone or zone["id"] in seen:
++            continue
++        seen.add(zone["id"])
++        zones.append(zone)
++        if len(zones) >= MAX_ZONES:
++            break
++    return zones
++
++
++def load_zones() -> list[dict[str, Any]]:
++    path = zones_file()
++    if not path.exists():
++        return []
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError) as exc:
++        logger.warning("Snap Map zones file unreadable (%s): %s", path, exc)
++        return []
++    if isinstance(data, dict):
++        data = data.get("zones", [])
++    return normalize_zones(data if isinstance(data, list) else [])
++
++
++def save_zones(raw_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    zones = normalize_zones(raw_list)
++    path = zones_file()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(".tmp")
++    tmp.write_text(json.dumps({"zones": zones}, ensure_ascii=False, indent=2), encoding="utf-8")
++    tmp.replace(path)
++    return zones
++
++
++# ---------------------------------------------------------------------------
++# SQLite store — aggregate counts and alerts only (no media, no identifiers)
++# ---------------------------------------------------------------------------
++def _connect() -> sqlite3.Connection:
++    path = db_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(str(path), timeout=10)
++    conn.execute(
++        """CREATE TABLE IF NOT EXISTS readings (
++            zone_id TEXT NOT NULL,
++            ts REAL NOT NULL,
++            hour_of_week INTEGER NOT NULL,
++            count_24h INTEGER NOT NULL,
++            count_1h INTEGER NOT NULL
++        )"""
++    )
++    conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_zone_ts ON readings(zone_id, ts)")
++    conn.execute(
++        """CREATE TABLE IF NOT EXISTS alerts (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            zone_id TEXT NOT NULL,
++            label TEXT NOT NULL,
++            ts REAL NOT NULL,
++            level TEXT NOT NULL,
++            z REAL NOT NULL,
++            count_1h INTEGER NOT NULL,
++            baseline_mean REAL,
++            reliability TEXT NOT NULL,
++            corroboration TEXT NOT NULL DEFAULT '[]',
++            confirmed INTEGER NOT NULL DEFAULT 0,
++            analyst_note TEXT
++        )"""
++    )
++    conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts)")
++    return conn
++
++
++def _hour_of_week(ts: float) -> int:
++    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
++    return dt.weekday() * 24 + dt.hour
++
++
++def record_reading(zone_id: str, ts: float, count_24h: int, count_1h: int) -> None:
++    with _db_lock, _connect() as conn:
++        conn.execute(
++            "INSERT INTO readings(zone_id, ts, hour_of_week, count_24h, count_1h) VALUES (?,?,?,?,?)",
++            (zone_id, ts, _hour_of_week(ts), int(count_24h), int(count_1h)),
++        )
++
++
++def purge_old_rows(now: float | None = None) -> None:
++    now = now or time.time()
++    with _db_lock, _connect() as conn:
++        conn.execute("DELETE FROM readings WHERE ts < ?", (now - READINGS_RETENTION_DAYS * 86400,))
++        conn.execute("DELETE FROM alerts WHERE ts < ?", (now - READINGS_RETENTION_DAYS * 86400,))
++
++
++def compute_baseline(zone_id: str, now: float) -> tuple[float | None, float | None, int]:
++    """Mean/std of last-hour counts for the same hour-of-week (±1h), last 28 days.
++
++    Falls back to every reading of the last 7 days while the zone warms up.
++    Returns (mean, std, n_samples); mean is None when samples are insufficient.
++    """
++    how = _hour_of_week(now)
++    buckets = {(how - 1) % 168, how, (how + 1) % 168}
++    with _db_lock, _connect() as conn:
++        rows = conn.execute(
++            "SELECT count_1h, hour_of_week FROM readings WHERE zone_id = ? AND ts >= ? AND ts < ?",
++            (zone_id, now - BASELINE_DAYS * 86400, now - 60),
++        ).fetchall()
++        seasonal = [r[0] for r in rows if r[1] in buckets]
++        if len(seasonal) < MIN_BASELINE_SAMPLES:
++            recent = conn.execute(
++                "SELECT count_1h FROM readings WHERE zone_id = ? AND ts >= ? AND ts < ?",
++                (zone_id, now - 7 * 86400, now - 60),
++            ).fetchall()
++            samples = [r[0] for r in recent]
++        else:
++            samples = seasonal
++    if len(samples) < MIN_BASELINE_SAMPLES:
++        return None, None, len(samples)
++    mean = sum(samples) / len(samples)
++    var = sum((s - mean) ** 2 for s in samples) / max(1, len(samples) - 1)
++    return mean, math.sqrt(var), len(samples)
++
++
++def score_anomaly(count_1h: int, mean: float | None, std: float | None) -> tuple[float, str]:
++    """Robust z-score with a Poisson floor so quiet zones don't alert on +2 snaps."""
++    if mean is None:
++        return 0.0, "warmup"
++    spread = max(std or 0.0, math.sqrt(max(mean, 0.0)), 1.0)
++    z = (count_1h - mean) / spread
++    if count_1h < 5:  # absolute floor: a handful of snaps is never an "event"
++        return round(z, 2), "normal"
++    if z >= 4:
++        return round(z, 2), "critical"
++    if z >= 3:
++        return round(z, 2), "high"
++    if z >= 2:
++        return round(z, 2), "elevated"
++    return round(z, 2), "normal"
++
++
++_LEVEL_RANK = {"normal": 0, "elevated": 1, "high": 2, "critical": 3}
++ALERT_DEDUP_SECONDS = 3600
++
++
++def record_alert(zone: dict[str, Any], ts: float, level: str, z: float, count_1h: int,
++                 mean: float | None, reliability: str, corroboration: list[dict[str, Any]]) -> int:
++    """Insert an alert, or fold it into the zone's open alert from the last hour.
++
++    A zone that stays hot only creates a new alert when its level escalates;
++    otherwise the open alert is refreshed (count, z, and C→B upgrade if
++    corroboration arrived). Analyst-confirmed alerts are never downgraded.
++    """
++    with _db_lock, _connect() as conn:
++        open_row = conn.execute(
++            """SELECT id, level, reliability, confirmed FROM alerts
++               WHERE zone_id = ? AND ts >= ? ORDER BY ts DESC LIMIT 1""",
++            (zone["id"], ts - ALERT_DEDUP_SECONDS),
++        ).fetchone()
++        if open_row and _LEVEL_RANK.get(level, 0) <= _LEVEL_RANK.get(open_row[1], 0):
++            alert_id, _lvl, old_rel, confirmed = open_row
++            new_rel = old_rel if (confirmed or old_rel == "B") else reliability
++            conn.execute(
++                """UPDATE alerts SET z = MAX(z, ?), count_1h = MAX(count_1h, ?), reliability = ?,
++                          corroboration = CASE WHEN ? != '[]' THEN ? ELSE corroboration END
++                   WHERE id = ?""",
++                (z, count_1h, new_rel, json.dumps(corroboration, ensure_ascii=False),
++                 json.dumps(corroboration, ensure_ascii=False), alert_id),
++            )
++            return int(alert_id)
++        cur = conn.execute(
++            """INSERT INTO alerts(zone_id, label, ts, level, z, count_1h, baseline_mean, reliability, corroboration)
++               VALUES (?,?,?,?,?,?,?,?,?)""",
++            (zone["id"], zone["label"], ts, level, z, count_1h, mean, reliability,
++             json.dumps(corroboration, ensure_ascii=False)),
++        )
++        return int(cur.lastrowid)
++
++
++def list_alerts(limit: int = 50) -> list[dict[str, Any]]:
++    with _db_lock, _connect() as conn:
++        rows = conn.execute(
++            """SELECT id, zone_id, label, ts, level, z, count_1h, baseline_mean, reliability,
++                      corroboration, confirmed, analyst_note
++               FROM alerts ORDER BY ts DESC LIMIT ?""",
++            (max(1, min(500, limit)),),
++        ).fetchall()
++    out = []
++    for r in rows:
++        out.append({
++            "id": r[0], "zone_id": r[1], "label": r[2],
++            "time": datetime.fromtimestamp(r[3], tz=timezone.utc).isoformat(),
++            "level": r[4], "z": r[5], "count_1h": r[6], "baseline_mean": r[7],
++            "reliability": r[8], "corroboration": json.loads(r[9] or "[]"),
++            "confirmed": bool(r[10]), "analyst_note": r[11],
++        })
++    return out
++
++
++def confirm_alert(alert_id: int, note: str = "") -> dict[str, Any] | None:
++    """Analyst confirmation after manual verification — the only path to an A rating."""
++    with _db_lock, _connect() as conn:
++        cur = conn.execute(
++            "UPDATE alerts SET confirmed = 1, reliability = 'A', analyst_note = ? WHERE id = ?",
++            (str(note or "")[:500], int(alert_id)),
++        )
++        if cur.rowcount == 0:
++            return None
++    for alert in list_alerts(500):
++        if alert["id"] == int(alert_id):
++            return alert
++    return None
++
++
++# ---------------------------------------------------------------------------
++# Upstream (Snap Map web endpoints)
++# ---------------------------------------------------------------------------
++class SnapmapRateLimited(RuntimeError):
++    pass
++
++
++def _headers() -> dict[str, str]:
++    return {
++        "Content-Type": "application/json",
++        "Accept": "application/json",
++        "Origin": "https://map.snapchat.com",
++        "Referer": "https://map.snapchat.com/",
++        "User-Agent": (
++            f"Mozilla/5.0 (compatible; {outbound_user_agent('snapmap-osint')}) "
++            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
++        ),
++    }
++
++
++def _post_json(path: str, body: dict[str, Any]) -> Any:
++    resp = fetch_with_curl(f"{API_HOST}{path}", method="POST", json_data=body, timeout=20, headers=_headers())
++    if resp is None:
++        raise RuntimeError("no response")
++    text = (resp.text or "").strip()
++    if resp.status_code == 429 or text.lower().startswith("too many requests"):
++        raise SnapmapRateLimited(path)
++    if resp.status_code != 200:
++        raise RuntimeError(f"HTTP {resp.status_code}")
++    return json.loads(text)
++
++
++def fetch_heat_epoch() -> Any:
++    data = _post_json("/web/getLatestTileSet", {})
++    for entry in (data or {}).get("tileSetInfos", []):
++        ident = entry.get("id") or {}
++        if ident.get("type") == "HEAT":
++            return ident.get("epoch")
++    raise RuntimeError("HEAT tileset epoch not found")
++
++
++def _zoom_for_radius(radius_m: int) -> int:
++    if radius_m <= 1500:
++        return 14
++    if radius_m <= 5000:
++        return 12
++    if radius_m <= 20000:
++        return 10
++    return 8
++
++
++def fetch_zone_elements(zone: dict[str, Any], epoch: Any) -> list[dict[str, Any]]:
++    body = {
++        "requestGeoPoint": {"lat": zone["lat"], "lon": zone["lng"]},
++        "zoomLevel": _zoom_for_radius(zone["radius_m"]),
++        "tileSetId": {"flavor": "default", "epoch": epoch, "type": 1},
++        "radiusMeters": zone["radius_m"],
++        "maximumFuzzRadius": 0,
++    }
++    data = _post_json("/web/getPlaylist", body)
++    return list(((data or {}).get("manifest") or {}).get("elements") or [])
++
++
++def parse_element(el: dict[str, Any]) -> dict[str, Any] | None:
++    """Keep only non-identifying fields. Anything else in the element is dropped."""
++    snap_id = str(el.get("id") or "").strip()
++    info = el.get("snapInfo") or {}
++    try:
++        ts = int(el.get("timestamp")) / 1000.0
++    except (TypeError, ValueError):
++        return None
++    if not snap_id or ts <= 0:
++        return None
++    media = info.get("streamingMediaInfo") or {}
++    url = media.get("mediaUrl") or media.get("previewUrl")
++    media_type = "video" if info.get("snapMediaType") else "image"
++    locality = (
++        (info.get("title") or {}).get("fallback")
++        or (info.get("localitySubtitle") or {}).get("fallback")
++        or ""
++    )
++    return {
++        "id": snap_id[:64],
++        "ts": ts,
++        "time": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
++        "type": media_type,
++        "url": url if isinstance(url, str) else None,
++        "locality": str(locality)[:120],
++    }
++
++
++# ---------------------------------------------------------------------------
++# Filters and corroboration
++# ---------------------------------------------------------------------------
++def keyword_hits(items: list[dict[str, Any]], zone_keywords: list[str]) -> list[str]:
++    vocab = set(zone_keywords) | set(_DEFAULT_SECURITY_KEYWORDS)
++    hits: set[str] = set()
++    for item in items:
++        text = str(item.get("locality") or "").lower()
++        for kw in vocab:
++            if kw and kw in text:
++                hits.add(kw)
++    return sorted(hits)
++
++
++def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
++    r = 6371.0
++    p1, p2 = math.radians(lat1), math.radians(lat2)
++    dp, dl = math.radians(lat2 - lat1), math.radians(lng2 - lng1)
++    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
++    return 2 * r * math.asin(math.sqrt(a))
++
++
++def _item_coords(item: Any) -> tuple[float, float] | None:
++    if not isinstance(item, dict):
++        return None
++    try:
++        coords = item.get("coords")
++        if isinstance(coords, (list, tuple)) and len(coords) >= 2:
++            return float(coords[0]), float(coords[1])
++        for la, lo in (("lat", "lng"), ("lat", "lon"), ("latitude", "longitude")):
++            if item.get(la) is not None and item.get(lo) is not None:
++                return float(item[la]), float(item[lo])
++        geom = item.get("geometry") or {}
++        gc = geom.get("coordinates") if isinstance(geom, dict) else None
++        if isinstance(gc, (list, tuple)) and len(gc) >= 2 and not isinstance(gc[0], (list, tuple)):
++            return float(gc[1]), float(gc[0])
++    except (TypeError, ValueError):
++        return None
++    return None
++
++
++def _item_time(item: dict[str, Any]) -> float | None:
++    props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
++    for key in ("published", "pubDate", "timestamp", "time", "date"):
++        raw = item.get(key) or props.get(key)
++        if not raw:
++            continue
++        if isinstance(raw, (int, float)):
++            return float(raw) / (1000.0 if raw > 1e12 else 1.0)
++        try:
++            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
++        except ValueError:
++            continue
++    return None
++
++
++def _item_title(item: dict[str, Any]) -> str:
++    props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
++    return str(item.get("title") or props.get("title") or props.get("name") or item.get("name") or "")[:140]
++
++
++def find_corroboration(zone: dict[str, Any], snapshot: dict[str, Any], now: float) -> list[dict[str, Any]]:
++    """Independent signals from other layers near the zone, within the time window."""
++    max_km = zone["radius_m"] / 1000.0 + CORROBORATION_EXTRA_KM
++    window_start = now - CORROBORATION_WINDOW_H * 3600
++    sources: list[tuple[str, list[Any], bool]] = [
++        ("telegram_osint", list((snapshot.get("telegram_osint") or {}).get("posts") or []), True),
++        ("news", list(snapshot.get("news") or []), True),
++        ("gdelt", list(snapshot.get("gdelt") or []), False),
++        ("firms_fires", list(snapshot.get("firms_fires") or []), False),
++    ]
++    found: list[dict[str, Any]] = []
++    for layer, items, needs_time in sources:
++        best: dict[str, Any] | None = None
++        for item in items:
++            coords = _item_coords(item)
++            if not coords:
++                continue
++            dist = _haversine_km(zone["lat"], zone["lng"], coords[0], coords[1])
++            if dist > max_km:
++                continue
++            ts = _item_time(item) if isinstance(item, dict) else None
++            if needs_time and (ts is None or ts < window_start):
++                continue
++            if ts is not None and ts < window_start:
++                continue
++            if best is None or dist < best["distance_km"]:
++                best = {"layer": layer, "title": _item_title(item), "distance_km": round(dist, 1)}
++        if best:
++            found.append(best)
++    return found
++
++
++def rate_reliability(level: str, corroboration: list[dict[str, Any]]) -> str:
++    if level in {"elevated", "high", "critical"} and corroboration:
++        return "B"
++    return "C"
++
++
++# ---------------------------------------------------------------------------
++# Optional media archive (OFF by default)
++# ---------------------------------------------------------------------------
++def _archive_media(zone_id: str, items: list[dict[str, Any]]) -> None:
++    from urllib.parse import urlparse
++
++    day = datetime.now(timezone.utc).strftime("%Y%m%d")
++    target = archive_dir() / zone_id / day
++    target.mkdir(parents=True, exist_ok=True)
++    for item in items:
++        url = item.get("url")
++        if not url or not snap_media_host_allowed(urlparse(url).hostname):
++            continue
++        ext = "mp4" if item.get("type") == "video" else "jpg"
++        path = target / f"{item['id']}.{ext}"
++        if path.exists():
++            continue
++        try:
++            resp = fetch_with_curl(url, timeout=30, headers={"User-Agent": _headers()["User-Agent"]})
++            if resp is not None and resp.status_code == 200 and resp.content:
++                path.write_bytes(resp.content)
++        except Exception as exc:  # archive is best-effort
++            logger.debug("Snap Map archive download failed for %s: %s", item["id"], exc)
++
++
++def purge_archive(now: float | None = None) -> int:
++    root = archive_dir()
++    if not root.exists():
++        return 0
++    cutoff = (now or time.time()) - archive_retention_hours() * 3600
++    removed = 0
++    for path in root.rglob("*"):
++        if path.is_file() and path.stat().st_mtime < cutoff:
++            path.unlink(missing_ok=True)
++            removed += 1
++    for path in sorted(root.rglob("*"), reverse=True):
++        if path.is_dir() and not any(path.iterdir()):
++            path.rmdir()
++    return removed
++
++
++# ---------------------------------------------------------------------------
++# Main fetch
++# ---------------------------------------------------------------------------
++def _zone_skeleton(zone: dict[str, Any]) -> dict[str, Any]:
++    return {
++        **{k: zone[k] for k in ("id", "label", "lat", "lng", "radius_m", "category")},
++        "count_24h": 0, "count_1h": 0, "baseline_mean": None, "baseline_std": None,
++        "baseline_samples": 0, "z": 0.0, "level": "unknown", "reliability": "C",
++        "corroboration": [], "keyword_hits": [], "media": [], "status": "pending", "last_scan": None,
++    }
++
++
++def scan_zone(zone: dict[str, Any], epoch: Any, snapshot: dict[str, Any], now: float) -> dict[str, Any]:
++    out = _zone_skeleton(zone)
++    elements = fetch_zone_elements(zone, epoch)
++    items = [p for p in (parse_element(e) for e in elements) if p]
++    items = [i for i in items if i["ts"] >= now - 86400]
++    items.sort(key=lambda i: i["ts"], reverse=True)
++
++    count_24h = len(items)
++    count_1h = sum(1 for i in items if i["ts"] >= now - 3600)
++    mean, std, n = compute_baseline(zone["id"], now)
++    z, level = score_anomaly(count_1h, mean, std)
++    record_reading(zone["id"], now, count_24h, count_1h)
++
++    corroboration = find_corroboration(zone, snapshot, now) if level not in {"normal", "warmup"} else []
++    reliability = rate_reliability(level, corroboration)
++    media = [{k: i[k] for k in ("id", "time", "type", "url", "locality")} for i in items[:MEDIA_PER_ZONE]]
++
++    out.update({
++        "count_24h": count_24h,
++        "count_1h": count_1h,
++        "baseline_mean": round(mean, 2) if mean is not None else None,
++        "baseline_std": round(std, 2) if std is not None else None,
++        "baseline_samples": n,
++        "z": z,
++        "level": level,
++        "reliability": reliability,
++        "corroboration": corroboration,
++        "keyword_hits": keyword_hits(items, zone.get("keywords") or []),
++        "media": media,
++        "status": "warmup" if level == "warmup" else "ok",
++        "last_scan": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
++    })
++
++    if level in {"elevated", "high", "critical"}:
++        out["alert_id"] = record_alert(zone, now, level, z, count_1h, mean, reliability, corroboration)
++        if archive_media_enabled():
++            _archive_media(zone["id"], items[:MEDIA_PER_ZONE])
++    return out
++
++
++def fetch_snapmap_osint(*, sleep_between_zones: float = 2.0) -> dict[str, Any]:
++    if not is_any_active("snapmap_osint"):
++        return latest_data.get("snapmap_osint") or dict(_EMPTY_PAYLOAD)
++
++    if not snapmap_osint_enabled():
++        payload = {**_EMPTY_PAYLOAD, "disabled": True}
++        with _data_lock:
++            latest_data["snapmap_osint"] = payload
++        _mark_fresh("snapmap_osint")
++        return payload
++
++    zones = load_zones()
++    now = time.time()
++    with _data_lock:
++        snapshot = {
++            "telegram_osint": latest_data.get("telegram_osint"),
++            "news": latest_data.get("news"),
++            "gdelt": latest_data.get("gdelt"),
++            "firms_fires": latest_data.get("firms_fires"),
++        }
++        prior = {z.get("id"): z for z in (latest_data.get("snapmap_osint") or {}).get("zones") or []}
++
++    results: list[dict[str, Any]] = []
++    error: str | None = None
++    epoch = None
++    if zones:
++        try:
++            epoch = fetch_heat_epoch()
++        except SnapmapRateLimited:
++            error = "rate_limited"
++        except Exception as exc:
++            error = f"epoch: {exc}"
++
++    for idx, zone in enumerate(zones):
++        if epoch is None:
++            stale = dict(prior.get(zone["id"]) or _zone_skeleton(zone))
++            stale["status"] = "error"
++            results.append(stale)
++            continue
++        try:
++            results.append(scan_zone(zone, epoch, snapshot, now))
++        except SnapmapRateLimited:
++            error = "rate_limited"
++            logger.warning("Snap Map rate limit hit; stopping this cycle after %s zones", idx)
++            epoch = None  # remaining zones keep their last reading
++            stale = dict(prior.get(zone["id"]) or _zone_skeleton(zone))
++            stale["status"] = "error"
++            results.append(stale)
++        except Exception as exc:
++            logger.warning("Snap Map zone %s failed: %s", zone["id"], exc)
++            stale = dict(prior.get(zone["id"]) or _zone_skeleton(zone))
++            stale["status"] = "error"
++            results.append(stale)
++        if sleep_between_zones and idx < len(zones) - 1:
++            time.sleep(sleep_between_zones)
++
++    try:
++        purge_old_rows(now)
++        if archive_media_enabled():
++            purge_archive(now)
++    except Exception as exc:
++        logger.debug("Snap Map purge failed: %s", exc)
++
++    try:
++        alerts = list_alerts(50)
++    except Exception:
++        alerts = []
++
++    payload = {
++        "zones": results,
++        "alerts": alerts,
++        "total_zones": len(results),
++        "anomalies": sum(1 for r in results if r.get("level") in {"elevated", "high", "critical"}),
++        "timestamp": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
++        "interval_minutes": scan_interval_minutes(),
++        "archive_media": archive_media_enabled(),
++        "error": error,
++        "source": "Snap Map (public snaps, unofficial endpoint)",
++    }
++    with _data_lock:
++        latest_data["snapmap_osint"] = payload
++    _mark_fresh("snapmap_osint")
++    logger.info(
++        "Snap Map OSINT: %s zones scanned, %s anomalies%s",
++        len(results), payload["anomalies"], f" ({error})" if error else "",
++    )
++    return payload
+diff --git a/backend/services/layer_enable_refresh.py b/backend/services/layer_enable_refresh.py
+index 22aafaa..21675cb 100644
+--- a/backend/services/layer_enable_refresh.py
++++ b/backend/services/layer_enable_refresh.py
+@@ -27,6 +27,7 @@ _SLOW_LAYER_KEYS: frozenset[str] = frozenset(
+         "cyber_threats",
+         "scm_suppliers",
+         "telegram_osint",
++        "snapmap_osint",
+         "gt_risk",
+     }
+ )
+@@ -126,6 +127,12 @@ def _slow_fetch(key: str) -> None:
+         fetch_telegram_osint()
+         logger.info("Telegram OSINT loaded (layer enabled)")
+         return
++    if key == "snapmap_osint":
++        from services.fetchers.snapmap_osint import fetch_snapmap_osint
++
++        fetch_snapmap_osint()
++        logger.info("Snap Map OSINT loaded (layer enabled)")
++        return
+     if key == "gt_risk":
+         from analytics.integration import maybe_refresh_gt_analytics
+ 
+diff --git a/backend/tests/test_snapmap_osint.py b/backend/tests/test_snapmap_osint.py
+new file mode 100644
+index 0000000..5d3f0dc
+--- /dev/null
++++ b/backend/tests/test_snapmap_osint.py
+@@ -0,0 +1,230 @@
++"""Snap Map OSINT — guardrails, parsing, baseline/anomaly scoring, reliability, fetch cycle."""
++import json
++import time
++
++import pytest
++
++from services.fetchers import snapmap_osint as sm
++from services.fetchers._store import _data_lock, active_layers, latest_data
++
++
++@pytest.fixture()
++def tmp_store(tmp_path, monkeypatch):
++    monkeypatch.setenv("SNAPMAP_DB_PATH", str(tmp_path / "snap.db"))
++    monkeypatch.setenv("SNAPMAP_ZONES_FILE", str(tmp_path / "zones.json"))
++    monkeypatch.setenv("SNAPMAP_ARCHIVE_MEDIA", "false")
++    return tmp_path
++
++
++def _element(snap_id, ts, *, video=False, locality="Genève", extra=None):
++    el = {
++        "id": snap_id,
++        "timestamp": str(int(ts * 1000)),
++        "snapInfo": {
++            "snapMediaType": 1 if video else 0,
++            "streamingMediaInfo": {"mediaUrl": f"https://cf-st.sc-cdn.net/d/{snap_id}"},
++            "title": {"fallback": locality},
++        },
++    }
++    if extra:
++        el.update(extra)
++    return el
++
++
++# --- guardrails -------------------------------------------------------------
++def test_zone_radius_is_clamped_and_invalid_coords_rejected():
++    tiny = sm.normalize_zone({"label": "Bâtiment", "lat": 46.2, "lon": 6.1, "radius_m": 50})
++    huge = sm.normalize_zone({"label": "Pays", "lat": 46.2, "lon": 6.1, "radius_m": 500_000})
++    assert tiny["radius_m"] == sm.MIN_RADIUS_M
++    assert huge["radius_m"] == sm.MAX_RADIUS_M
++    assert sm.normalize_zone({"lat": 999, "lon": 6.1}) is None
++    assert sm.normalize_zone({"lat": 0, "lon": 0}) is None
++    assert sm.normalize_zone({"lat": "x", "lon": 6.1}) is None
++
++
++def test_zone_count_is_capped_and_ids_deduplicated():
++    raw = [{"id": "z", "lat": 46.0 + i * 0.01, "lon": 6.0} for i in range(3)]
++    raw += [{"id": f"z{i}", "lat": 46.0, "lon": 6.0 + i * 0.01} for i in range(60)]
++    zones = sm.normalize_zones(raw)
++    assert len(zones) == sm.MAX_ZONES
++    assert [z["id"] for z in zones].count("z") == 1
++
++
++def test_save_and_load_zones_roundtrip(tmp_store):
++    saved = sm.save_zones([{"label": "Gare Cornavin", "lat": 46.21, "lon": 6.142, "radius_m": 1500}])
++    assert saved[0]["id"] == "gare-cornavin"
++    assert sm.load_zones() == saved
++
++
++def test_interval_has_floor(monkeypatch):
++    monkeypatch.setenv("SNAPMAP_OSINT_INTERVAL_MINUTES", "1")
++    assert sm.scan_interval_minutes() == sm.MIN_INTERVAL_MINUTES
++
++
++# --- parsing / privacy ------------------------------------------------------
++def test_parse_element_drops_everything_but_whitelisted_fields():
++    now = time.time()
++    el = _element("abc", now, video=True, extra={
++        "publicUserInfo": {"username": "someone", "displayName": "Some One"},
++    })
++    el["snapInfo"]["publisherInfo"] = {"username": "someone"}
++    parsed = sm.parse_element(el)
++    assert set(parsed) == {"id", "ts", "time", "type", "url", "locality"}
++    assert parsed["type"] == "video"
++    assert "someone" not in json.dumps(parsed)
++
++
++def test_parse_element_rejects_garbage():
++    assert sm.parse_element({"id": "x"}) is None
++    assert sm.parse_element({"timestamp": "123"}) is None
++
++
++def test_media_host_allowlist():
++    assert sm.snap_media_host_allowed("cf-st.sc-cdn.net")
++    assert not sm.snap_media_host_allowed("evil.example.com")
++    assert not sm.snap_media_host_allowed("sc-cdn.net.evil.com")
++    assert not sm.snap_media_host_allowed(None)
++
++
++# --- scoring ----------------------------------------------------------------
++def test_score_anomaly_levels_and_floors():
++    assert sm.score_anomaly(10, None, None)[1] == "warmup"
++    assert sm.score_anomaly(4, 0.2, 0.4)[1] == "normal"  # absolute floor of 5 snaps
++    assert sm.score_anomaly(12, 10, 2)[1] == "normal"
++    # Poisson floor: spread = max(std=2, sqrt(10)=3.16) -> z = 7/3.16 = 2.2
++    assert sm.score_anomaly(17, 10, 2)[1] == "elevated"
++    assert sm.score_anomaly(20, 10, 2)[1] == "high"
++    z, level = sm.score_anomaly(40, 10, 2)
++    assert level == "critical" and z > 4
++
++
++def test_baseline_needs_warmup_then_uses_history(tmp_store):
++    now = time.time()
++    assert sm.compute_baseline("z", now)[0] is None
++    for i in range(1, 9):
++        sm.record_reading("z", now - i * 300, 50, 10)  # all inside the ±1h seasonal bucket
++    mean, std, n = sm.compute_baseline("z", now)
++    assert n == 8 and mean == pytest.approx(10.0)
++
++
++# --- reliability / corroboration -------------------------------------------
++def test_reliability_is_c_alone_b_when_corroborated_never_a_automatically():
++    assert sm.rate_reliability("high", []) == "C"
++    assert sm.rate_reliability("normal", [{"layer": "news"}]) == "C"
++    assert sm.rate_reliability("high", [{"layer": "news"}]) == "B"
++
++
++def test_corroboration_respects_distance_and_time_window():
++    now = time.time()
++    zone = sm.normalize_zone({"label": "Genève", "lat": 46.2044, "lon": 6.1432, "radius_m": 2000})
++    recent = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now - 1800))
++    old = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now - 3 * 86400))
++    snapshot = {
++        "telegram_osint": {"posts": [
++            {"title": "Explosion à Genève", "coords": [46.21, 6.14], "published": recent},
++            {"title": "Vieux post", "coords": [46.21, 6.14], "published": old},
++        ]},
++        "news": [{"title": "Paris", "coords": [48.85, 2.35], "published": recent}],
++        "gdelt": [],
++        "firms_fires": [{"lat": 46.20, "lng": 6.15, "frp": 12.0}],
++    }
++    found = sm.find_corroboration(zone, snapshot, now)
++    layers = {f["layer"] for f in found}
++    assert layers == {"telegram_osint", "firms_fires"}
++    assert next(f for f in found if f["layer"] == "telegram_osint")["title"] == "Explosion à Genève"
++
++
++def test_alerts_are_deduplicated_and_confirmation_gives_a(tmp_store):
++    zone = sm.normalize_zone({"label": "Zone", "lat": 46.2, "lon": 6.1})
++    now = time.time()
++    a1 = sm.record_alert(zone, now, "elevated", 2.5, 20, 10.0, "C", [])
++    a2 = sm.record_alert(zone, now + 900, "elevated", 2.8, 22, 10.0, "B", [{"layer": "news"}])
++    assert a1 == a2
++    a3 = sm.record_alert(zone, now + 1800, "critical", 5.0, 50, 10.0, "C", [])
++    assert a3 != a1
++    alerts = {a["id"]: a for a in sm.list_alerts()}
++    assert alerts[a1]["reliability"] == "B" and alerts[a1]["count_1h"] == 22
++    confirmed = sm.confirm_alert(a3, "Vérifié : vidéo géolocalisée + dépêche Keystone-ATS")
++    assert confirmed["reliability"] == "A" and confirmed["confirmed"] is True
++
++
++# --- full fetch cycle -------------------------------------------------------
++class _Resp:
++    def __init__(self, payload, status=200):
++        self.status_code = status
++        self.text = payload if isinstance(payload, str) else json.dumps(payload)
++        self.content = self.text.encode()
++
++
++def test_fetch_cycle_scores_zone_and_publishes_payload(tmp_store, monkeypatch):
++    sm.save_zones([{"id": "gva", "label": "Genève", "lat": 46.2044, "lon": 6.1432, "radius_m": 2000}])
++    now = time.time()
++    for i in range(1, 9):  # quiet baseline ~2 snaps/hour
++        sm.record_reading("gva", now - i * 900, 30, 2)
++
++    elements = [_element(f"s{i}", now - 60 * (i % 50)) for i in range(25)]  # 25 snaps in the last hour
++
++    calls = []
++
++    def fake_fetch(url, method="GET", json_data=None, **kw):
++        calls.append(url)
++        if url.endswith("/web/getLatestTileSet"):
++            return _Resp({"tileSetInfos": [{"id": {"type": "HEAT", "epoch": "123"}}]})
++        if url.endswith("/web/getPlaylist"):
++            assert json_data["radiusMeters"] == 2000
++            return _Resp({"manifest": {"elements": elements}})
++        raise AssertionError(url)
++
++    monkeypatch.setattr(sm, "fetch_with_curl", fake_fetch)
++    monkeypatch.setitem(active_layers, "snapmap_osint", True)
++
++    payload = sm.fetch_snapmap_osint(sleep_between_zones=0)
++    zone = payload["zones"][0]
++    assert zone["count_1h"] == 25
++    assert zone["level"] == "critical"
++    assert zone["reliability"] == "C"
++    assert zone["alert_id"] >= 1
++    assert len(zone["media"]) == sm.MEDIA_PER_ZONE
++    assert payload["anomalies"] == 1 and payload["error"] is None
++    with _data_lock:
++        assert latest_data["snapmap_osint"]["zones"][0]["id"] == "gva"
++
++
++def test_rate_limit_keeps_previous_readings(tmp_store, monkeypatch):
++    sm.save_zones([{"id": "gva", "label": "Genève", "lat": 46.2, "lon": 6.14}])
++    monkeypatch.setattr(sm, "fetch_with_curl", lambda *a, **k: _Resp("Too many requests"))
++    monkeypatch.setitem(active_layers, "snapmap_osint", True)
++    payload = sm.fetch_snapmap_osint(sleep_between_zones=0)
++    assert payload["error"] == "rate_limited"
++    assert payload["zones"][0]["status"] == "error"
++
++
++def test_inactive_layer_does_not_hit_upstream(tmp_store, monkeypatch):
++    monkeypatch.setitem(active_layers, "snapmap_osint", False)
++    monkeypatch.setattr(sm, "fetch_with_curl", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no call")))
++    sm.fetch_snapmap_osint(sleep_between_zones=0)
++
++
++# --- API --------------------------------------------------------------------
++def test_api_feed_zones_and_confirm(tmp_store, client):
++    feed = client.get("/api/snapmap-feed")
++    assert feed.status_code == 200 and "zones" in feed.json()
++
++    put = client.put("/api/snapmap/zones", json={"zones": [
++        {"label": "Gare", "lat": 46.21, "lon": 6.142, "radius_m": 10},
++        {"label": "Invalide", "lat": 500, "lon": 6.1},
++    ]})
++    assert put.status_code == 200
++    body = put.json()
++    assert body["accepted"] == 1 and body["zones"][0]["radius_m"] == sm.MIN_RADIUS_M
++
++    zone = sm.load_zones()[0]
++    alert_id = sm.record_alert(zone, time.time(), "high", 3.5, 30, 8.0, "C", [])
++    assert client.post(f"/api/snapmap/alerts/{alert_id}/confirm", json={}).status_code == 400
++    ok = client.post(f"/api/snapmap/alerts/{alert_id}/confirm", json={"note": "vidéo géolocalisée"})
++    assert ok.status_code == 200 and ok.json()["reliability"] == "A"
++    assert client.get("/api/snapmap/media", params={"url": "https://evil.example.com/x"}).status_code == 403
++
++
++def test_api_zone_writes_require_local_operator(tmp_store, remote_client):
++    assert remote_client.put("/api/snapmap/zones", json={"zones": []}).status_code in (401, 403)
+diff --git a/frontend/src/components/MaplibreViewer.tsx b/frontend/src/components/MaplibreViewer.tsx
+index 72d4cde..7acfa94 100644
+--- a/frontend/src/components/MaplibreViewer.tsx
++++ b/frontend/src/components/MaplibreViewer.tsx
+@@ -197,6 +197,7 @@ import { WastewaterPopup } from '@/components/MaplibreViewer/popups/WastewaterPo
+ import { MilitaryBasePopup } from '@/components/MaplibreViewer/popups/MilitaryBasePopup';
+ import { RegionDossierPanel } from '@/components/MaplibreViewer/popups/RegionDossierPanel';
+ import { GtRiskPopup } from '@/components/MaplibreViewer/popups/GtRiskPopup';
++import { SnapmapOsintPopup } from '@/components/MaplibreViewer/popups/SnapmapOsintPopup';
+ import { TelegramOsintPopup } from '@/components/MaplibreViewer/popups/TelegramOsintPopup';
+ import {
+   buildSentinelTileUrl,
+@@ -209,6 +210,7 @@ import {
+   buildJammingGeoJSON,
+   buildCorrelationsGeoJSON,
+   buildGtRiskGeoJSON,
++  buildSnapmapOsintGeoJSON,
+   buildTinygsGeoJSON,
+   buildShodanGeoJSON,
+   buildAIIntelGeoJSON,
+@@ -312,6 +314,7 @@ function flightPayloadHasKnownRoute(entity: ReturnType<typeof findSelectedEntity
+ }
+ 
+ const MAP_EXTRA_DATA_KEYS = [
++  'snapmap_osint',
+   'air_quality',
+   'cctv',
+   'correlations',
+@@ -816,6 +819,10 @@ const MaplibreViewer = ({
+     () => (activeLayers.gt_risk ? buildGtRiskGeoJSON(data?.gt_risk) : null),
+     [activeLayers.gt_risk, data?.gt_risk],
+   );
++  const snapmapGeoJSON = useMemo(
++    () => (activeLayers.snapmap_osint ? buildSnapmapOsintGeoJSON(data?.snapmap_osint) : null),
++    [activeLayers.snapmap_osint, data?.snapmap_osint],
++  );
+ 
+   const tinygsGeoJSON = useMemo(
+     () => {
+@@ -1789,6 +1796,8 @@ const MaplibreViewer = ({
+     correlationsGeoJSON && 'corr-contra-fill',
+     correlationsGeoJSON && 'corr-analysis-fill',
+     gtRiskGeoJSON && 'gt-risk-heatmap',
++    snapmapGeoJSON && 'snapmap-zone-fill',
++    snapmapGeoJSON && 'snapmap-zone-center',
+   ].filter(Boolean) as string[];
+ 
+   useEffect(() => {
+@@ -1867,6 +1876,7 @@ const MaplibreViewer = ({
+   useImperativeSource(mapForHook, 'earthquakes', earthquakesGeoJSON, 100);
+   useImperativeSource(mapForHook, 'gps-jamming', jammingGeoJSON, 150);
+   useImperativeSource(mapForHook, 'gt-risk-source', gtRiskGeoJSON, 150);
++  useImperativeSource(mapForHook, 'snapmap-source', snapmapGeoJSON, 150);
+   useImperativeSource(mapForHook, 'correlations', correlationsGeoJSON, 100);
+   useImperativeSource(mapForHook, 'shodan-overlay', shodanGeoJSON, 100);
+   useImperativeSource(mapForHook, 'ai-intel-source', aiIntelGeoJSON, 80);
+@@ -2358,6 +2368,66 @@ const MaplibreViewer = ({
+           />
+         </Source>
+ 
++        {/* Snap Map OSINT — watch-zone footprints coloured by anomaly level, centre sized by last-hour activity */}
++        <Source id="snapmap-source" type="geojson" data={EMPTY_FC}>
++          <Layer
++            id="snapmap-zone-fill"
++            type="fill"
++            filter={['==', ['get', 'geom'], 'zone']}
++            paint={{
++              'fill-color': ['get', 'color'],
++              'fill-opacity': [
++                'match',
++                ['get', 'level'],
++                'critical', 0.32,
++                'high', 0.26,
++                'elevated', 0.2,
++                0.08,
++              ],
++            }}
++          />
++          <Layer
++            id="snapmap-zone-outline"
++            type="line"
++            filter={['==', ['get', 'geom'], 'zone']}
++            paint={{
++              'line-color': ['get', 'color'],
++              'line-width': ['match', ['get', 'level'], 'critical', 2.5, 'high', 2, 1],
++              'line-dasharray': [2, 1.5],
++            }}
++          />
++          <Layer
++            id="snapmap-zone-center"
++            type="circle"
++            filter={['==', ['get', 'geom'], 'center']}
++            paint={{
++              'circle-radius': ['interpolate', ['linear'], ['get', 'count_1h'], 0, 5, 10, 9, 50, 16, 200, 26],
++              'circle-color': ['get', 'color'],
++              'circle-opacity': 0.85,
++              'circle-stroke-width': ['match', ['get', 'reliability'], 'A', 3, 'B', 2, 1],
++              'circle-stroke-color': ['match', ['get', 'reliability'], 'A', '#10b981', 'B', '#38bdf8', '#e4e4e7'],
++            }}
++          />
++          <Layer
++            id="snapmap-zone-label"
++            type="symbol"
++            minzoom={6}
++            filter={['==', ['get', 'geom'], 'center']}
++            layout={{
++              'text-field': ['concat', ['get', 'name'], '\n', ['get', 'tag']],
++              'text-size': 10,
++              'text-offset': [0, 1.6],
++              'text-anchor': 'top',
++              'text-allow-overlap': false,
++            }}
++            paint={{
++              'text-color': '#fde68a',
++              'text-halo-color': '#000000',
++              'text-halo-width': 1.5,
++            }}
++          />
++        </Source>
++
+         {/* Correlation Alerts — Emergent Intelligence grid squares */}
+         <Source id="correlations" type="geojson" data={EMPTY_FC}>
+           {/* RF Anomaly — grey */}
+@@ -5872,6 +5942,13 @@ const MaplibreViewer = ({
+           );
+         })()}
+ 
++        {(() => {
++          if (selectedEntity?.type !== 'snapmap_osint' || !data?.snapmap_osint?.zones) return null;
++          const zone = data.snapmap_osint.zones.find((z) => z.id === selectedEntity.id);
++          if (!zone) return null;
++          return <SnapmapOsintPopup zone={zone} onClose={() => onEntityClick?.(null)} />;
++        })()}
++
+         {(() => {
+           if (selectedEntity?.type !== 'telegram_osint' || !data?.telegram_osint?.posts) return null;
+           const allPosts = data.telegram_osint.posts;
+diff --git a/frontend/src/components/MaplibreViewer/popups/SnapmapOsintPopup.tsx b/frontend/src/components/MaplibreViewer/popups/SnapmapOsintPopup.tsx
+new file mode 100644
+index 0000000..6ab0135
+--- /dev/null
++++ b/frontend/src/components/MaplibreViewer/popups/SnapmapOsintPopup.tsx
+@@ -0,0 +1,187 @@
++'use client';
++
++import React, { useState } from 'react';
++import { Popup } from 'react-map-gl/maplibre';
++import { Activity, ShieldCheck } from 'lucide-react';
++import { useTranslation } from '@/i18n';
++import { API_BASE } from '@/lib/api';
++import { SNAPMAP_LEVEL_COLORS } from '@/components/map/geoJSONBuilders';
++import type { SnapmapReliability, SnapmapZone } from '@/types/dashboard';
++
++const RELIABILITY_STYLE: Record<SnapmapReliability, string> = {
++  A: 'bg-emerald-600 text-white',
++  B: 'bg-sky-600 text-white',
++  C: 'bg-zinc-600 text-white',
++};
++
++function mediaSrc(url: string | null): string | null {
++  if (!url) return null;
++  return `${API_BASE}/api/snapmap/media?url=${encodeURIComponent(url)}`;
++}
++
++function timeAgo(iso: string | null | undefined): string {
++  if (!iso) return '—';
++  const minutes = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
++  if (minutes < 60) return `${minutes} min`;
++  return `${Math.round(minutes / 60)} h`;
++}
++
++export interface SnapmapOsintPopupProps {
++  zone: SnapmapZone;
++  onClose: () => void;
++}
++
++export function SnapmapOsintPopup({ zone, onClose }: SnapmapOsintPopupProps) {
++  const { t } = useTranslation();
++  const [note, setNote] = useState('');
++  const [rating, setRating] = useState<SnapmapReliability>(zone.reliability);
++  const [confirmState, setConfirmState] = useState<'idle' | 'sending' | 'error'>('idle');
++  const color = SNAPMAP_LEVEL_COLORS[zone.level] || SNAPMAP_LEVEL_COLORS.unknown;
++  const canConfirm = Boolean(zone.alert_id) && rating !== 'A';
++
++  async function confirm() {
++    if (!zone.alert_id || !note.trim()) return;
++    setConfirmState('sending');
++    try {
++      const res = await fetch(`${API_BASE}/api/snapmap/alerts/${zone.alert_id}/confirm`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ note: note.trim() }),
++      });
++      if (!res.ok) throw new Error(String(res.status));
++      setRating('A');
++      setConfirmState('idle');
++    } catch {
++      setConfirmState('error');
++    }
++  }
++
++  return (
++    <Popup
++      longitude={zone.lng}
++      latitude={zone.lat}
++      closeButton={false}
++      closeOnClick={false}
++      onClose={onClose}
++      className="threat-popup"
++      maxWidth="380px"
++    >
++      <div className="bg-black/95 border border-yellow-700/50 rounded-lg overflow-hidden font-mono text-[11px]">
++        <div className="px-3 py-2 border-b border-yellow-800/40 bg-yellow-950/40 flex items-center gap-2">
++          <Activity size={14} className="text-yellow-400" />
++          <span className="text-yellow-300 font-bold tracking-widest text-[10px] uppercase truncate">
++            {zone.label}
++          </span>
++          <span
++            className={`ml-auto px-1.5 py-0.5 rounded text-[10px] font-bold ${RELIABILITY_STYLE[rating]}`}
++            title={t('snapmap.reliabilityHint')}
++          >
++            {rating}
++          </span>
++          <button type="button" onClick={onClose} className="text-[var(--text-muted)] hover:text-white">
++            ✕
++          </button>
++        </div>
++
++        <div className="p-3 flex flex-col gap-2 max-h-80 overflow-y-auto styled-scrollbar">
++          <div className="flex justify-between items-center">
++            <span className="text-[var(--text-muted)]">{t('snapmap.level')}</span>
++            <span className="font-bold uppercase" style={{ color }}>
++              {zone.level}
++              {zone.level !== 'warmup' && zone.level !== 'unknown' ? ` · z ${zone.z.toFixed(1)}` : ''}
++            </span>
++          </div>
++          <div className="grid grid-cols-3 gap-2 text-[10px]">
++            <div>
++              <div className="text-[var(--text-muted)]">{t('snapmap.lastHour')}</div>
++              <div className="text-white font-bold">{zone.count_1h}</div>
++            </div>
++            <div>
++              <div className="text-[var(--text-muted)]">{t('snapmap.baseline')}</div>
++              <div className="text-white">{zone.baseline_mean ?? '—'}</div>
++            </div>
++            <div>
++              <div className="text-[var(--text-muted)]">24 h</div>
++              <div className="text-white">{zone.count_24h}</div>
++            </div>
++          </div>
++
++          {zone.level === 'warmup' && (
++            <div className="text-[10px] text-[var(--text-muted)]">{t('snapmap.warmup')}</div>
++          )}
++
++          {zone.corroboration.length > 0 && (
++            <div className="flex flex-col gap-1">
++              <div className="text-[var(--text-muted)] text-[10px]">{t('snapmap.corroboration')}</div>
++              {zone.corroboration.map((c) => (
++                <div key={`${c.layer}-${c.title}`} className="text-[10px] text-sky-300 truncate" title={c.title}>
++                  [{c.layer}] {c.title || '—'} · {c.distance_km} km
++                </div>
++              ))}
++            </div>
++          )}
++
++          {zone.keyword_hits.length > 0 && (
++            <div className="text-[10px] text-orange-300">
++              {t('snapmap.keywords')}: {zone.keyword_hits.join(', ')}
++            </div>
++          )}
++
++          {zone.media.length > 0 && (
++            <div className="grid grid-cols-3 gap-1">
++              {zone.media.slice(0, 9).map((m) => {
++                const src = mediaSrc(m.url);
++                if (!src) return null;
++                return m.type === 'video' ? (
++                  <video
++                    key={m.id}
++                    src={src}
++                    className="w-full aspect-[9/16] object-cover rounded bg-zinc-900"
++                    muted
++                    controls
++                    preload="none"
++                    title={`${m.locality || ''} · ${timeAgo(m.time)}`}
++                  />
++                ) : (
++                  // eslint-disable-next-line @next/next/no-img-element
++                  <img
++                    key={m.id}
++                    src={src}
++                    alt={m.locality || 'snap'}
++                    loading="lazy"
++                    className="w-full aspect-[9/16] object-cover rounded bg-zinc-900"
++                    title={`${m.locality || ''} · ${timeAgo(m.time)}`}
++                  />
++                );
++              })}
++            </div>
++          )}
++
++          {canConfirm && (
++            <div className="flex flex-col gap-1 border-t border-zinc-800 pt-2">
++              <input
++                value={note}
++                onChange={(e) => setNote(e.target.value)}
++                placeholder={t('snapmap.confirmPlaceholder')}
++                className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[10px] text-white"
++              />
++              <button
++                type="button"
++                disabled={!note.trim() || confirmState === 'sending'}
++                onClick={() => void confirm()}
++                className="flex items-center justify-center gap-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-40 px-2 py-1 text-[10px] text-white"
++              >
++                <ShieldCheck size={12} /> {t('snapmap.confirm')}
++              </button>
++              {confirmState === 'error' && <div className="text-[10px] text-red-400">{t('snapmap.confirmError')}</div>}
++            </div>
++          )}
++
++          <div className="text-[9px] text-[var(--text-muted)] border-t border-zinc-800 pt-2">
++            {t('snapmap.scanned')} {timeAgo(zone.last_scan)} · {t('snapmap.disclaimer')}
++          </div>
++        </div>
++      </div>
++    </Popup>
++  );
++}
+diff --git a/frontend/src/components/WorldviewLeftPanel.tsx b/frontend/src/components/WorldviewLeftPanel.tsx
+index 9e4ba87..00dd7d2 100644
+--- a/frontend/src/components/WorldviewLeftPanel.tsx
++++ b/frontend/src/components/WorldviewLeftPanel.tsx
+@@ -123,6 +123,7 @@ const FRESHNESS_MAP: Record<string, string> = {
+   scm_suppliers: 'scm_suppliers',
+   cyber_threats: 'cyber_threats',
+   telegram_osint: 'telegram_osint',
++  snapmap_osint: 'snapmap_osint',
+   gt_risk: 'gt_risk',
+ };
+ 
+@@ -199,6 +200,7 @@ const WORLDVIEW_PANEL_DATA_KEYS = [
+   'frontlines',
+   'gdelt',
+   'telegram_osint',
++  'snapmap_osint',
+   'crowdthreat',
+   'correlations',
+   'gt_risk',
+@@ -1506,6 +1508,13 @@ const WorldviewLeftPanel = React.memo(function WorldviewLeftPanel({
+           count: data?.telegram_osint?.geolocated || 0,
+           icon: Radio,
+         },
++        {
++          id: 'snapmap_osint',
++          name: t('layers.snapmapOsint'),
++          source: 'Snap Map · watch zones',
++          count: data?.snapmap_osint?.anomalies || 0,
++          icon: MapPin,
++        },
+         {
+           id: 'crowdthreat',
+           name: t('layers.crowdThreat'),
+diff --git a/frontend/src/components/map/geoJSONBuilders.ts b/frontend/src/components/map/geoJSONBuilders.ts
+index ca475af..24ae5f6 100644
+--- a/frontend/src/components/map/geoJSONBuilders.ts
++++ b/frontend/src/components/map/geoJSONBuilders.ts
+@@ -1717,6 +1717,85 @@ export function buildTelegramOsintGeoJSON(
+   };
+ }
+ 
++// ─── Snap Map OSINT (watch-zone activity density) ─────────────────────────
++
++export const SNAPMAP_LEVEL_COLORS: Record<string, string> = {
++  unknown: '#64748b',
++  warmup: '#64748b',
++  normal: '#22c55e',
++  elevated: '#eab308',
++  high: '#f97316',
++  critical: '#ef4444',
++};
++
++/** 48-gon approximating a geodesic circle — good enough for zones ≤ 85 km. */
++function snapmapCircleRing(lat: number, lng: number, radiusM: number, steps = 48): [number, number][] {
++  const ring: [number, number][] = [];
++  const dLat = radiusM / 111_320;
++  const dLng = radiusM / (111_320 * Math.max(0.01, Math.cos((lat * Math.PI) / 180)));
++  for (let i = 0; i <= steps; i += 1) {
++    const a = (i / steps) * 2 * Math.PI;
++    ring.push([lng + dLng * Math.cos(a), lat + dLat * Math.sin(a)]);
++  }
++  return ring;
++}
++
++/**
++ * One footprint polygon + one centroid point per watch zone.
++ * The point carries the activity count (circle size) and the A/B/C rating (label).
++ */
++export function buildSnapmapOsintGeoJSON(
++  payload?: {
++    zones?: Array<{
++      id: string;
++      label: string;
++      lat: number;
++      lng: number;
++      radius_m: number;
++      count_1h?: number;
++      count_24h?: number;
++      level?: string;
++      reliability?: string;
++      z?: number;
++      status?: string;
++    }>;
++  } | null,
++): FC {
++  const zones = payload?.zones;
++  if (!zones?.length) return null;
++  const features: GeoJSON.Feature[] = [];
++  for (const zone of zones) {
++    if (!Number.isFinite(zone.lat) || !Number.isFinite(zone.lng)) continue;
++    const level = zone.level || 'unknown';
++    const props = {
++      id: zone.id,
++      type: 'snapmap_osint',
++      name: zone.label,
++      lat: zone.lat,
++      lng: zone.lng,
++      level,
++      color: SNAPMAP_LEVEL_COLORS[level] || SNAPMAP_LEVEL_COLORS.unknown,
++      count_1h: zone.count_1h ?? 0,
++      count_24h: zone.count_24h ?? 0,
++      reliability: zone.reliability || 'C',
++      z: zone.z ?? 0,
++      status: zone.status || 'pending',
++      tag: `${zone.reliability || 'C'} · ${zone.count_1h ?? 0}/h`,
++    };
++    features.push({
++      type: 'Feature',
++      properties: { ...props, geom: 'zone' },
++      geometry: { type: 'Polygon', coordinates: [snapmapCircleRing(zone.lat, zone.lng, zone.radius_m)] },
++    });
++    features.push({
++      type: 'Feature',
++      properties: { ...props, geom: 'center' },
++      geometry: { type: 'Point', coordinates: [zone.lng, zone.lat] },
++    });
++  }
++  return features.length ? { type: 'FeatureCollection', features } : null;
++}
++
+ // ─── Malware C2 / URLhaus ─────────────────────────────────────────────────
+ 
+ export function buildMalwareGeoJSON(
+diff --git a/frontend/src/components/map/snapmapGeoJSON.test.ts b/frontend/src/components/map/snapmapGeoJSON.test.ts
+new file mode 100644
+index 0000000..8ba9eab
+--- /dev/null
++++ b/frontend/src/components/map/snapmapGeoJSON.test.ts
+@@ -0,0 +1,28 @@
++import { describe, expect, it } from 'vitest';
++import { buildSnapmapOsintGeoJSON, SNAPMAP_LEVEL_COLORS } from '@/components/map/geoJSONBuilders';
++
++describe('buildSnapmapOsintGeoJSON', () => {
++  it('returns null without zones', () => {
++    expect(buildSnapmapOsintGeoJSON(null)).toBeNull();
++    expect(buildSnapmapOsintGeoJSON({ zones: [] })).toBeNull();
++  });
++
++  it('emits a footprint polygon and a centre point per zone with level colour and A/B/C tag', () => {
++    const fc = buildSnapmapOsintGeoJSON({
++      zones: [
++        { id: 'gva', label: 'Genève', lat: 46.2, lng: 6.14, radius_m: 2000, count_1h: 25, level: 'critical', reliability: 'B' },
++        { id: 'bad', label: 'Bad', lat: Number.NaN, lng: 6, radius_m: 1000 },
++      ],
++    });
++    expect(fc?.features).toHaveLength(2);
++    const [zone, centre] = fc!.features;
++    expect(zone.geometry.type).toBe('Polygon');
++    expect(centre.geometry.type).toBe('Point');
++    expect(centre.properties?.color).toBe(SNAPMAP_LEVEL_COLORS.critical);
++    expect(centre.properties?.tag).toBe('B · 25/h');
++    // ring radius ≈ 2 km in latitude
++    const ring = (zone.geometry as GeoJSON.Polygon).coordinates[0];
++    const maxLat = Math.max(...ring.map((c) => c[1]));
++    expect(maxLat - 46.2).toBeCloseTo(2000 / 111_320, 4);
++  });
++});
+diff --git a/frontend/src/i18n/translations/en.json b/frontend/src/i18n/translations/en.json
+index 6e020f3..586ac34 100644
+--- a/frontend/src/i18n/translations/en.json
++++ b/frontend/src/i18n/translations/en.json
+@@ -212,7 +212,8 @@
+     "telegramOsint": "Telegram OSINT",
+     "strategicRisk": "Strategic Risk Heatmap",
+     "derivedOsint": "Derived OSINT (Strategic Risk)",
+-    "derivedOsintSource": "Experimental · off by default"
++    "derivedOsintSource": "Experimental · off by default",
++    "snapmapOsint": "Snap Map activity (zones)"
+   },
+   "gtLean": {
+     "title": "Enable Derived OSINT on a lean node?",
+@@ -350,5 +351,19 @@
+     "translatedFrom": "Translated from {lang}",
+     "showOriginal": "SHOW ORIGINAL ({lang})",
+     "showTranslation": "SHOW TRANSLATION"
++  },
++  "snapmap": {
++    "level": "Level",
++    "lastHour": "Last hour",
++    "baseline": "Baseline",
++    "warmup": "Calibrating: the baseline builds up over the next scans.",
++    "corroboration": "Corroboration (other layers)",
++    "keywords": "Keywords",
++    "reliabilityHint": "A = analyst-verified · B = corroborated by another source · C = Snap Map only",
++    "confirmPlaceholder": "Verification note (geolocation, source…)",
++    "confirm": "Confirm after verification (A)",
++    "confirmError": "Confirmation failed",
++    "scanned": "Scanned",
++    "disclaimer": "Public snap density — a lead to verify, not an established fact."
+   }
+ }
+diff --git a/frontend/src/i18n/translations/fa.json b/frontend/src/i18n/translations/fa.json
+index 059a9c0..a3ef3a0 100644
+--- a/frontend/src/i18n/translations/fa.json
++++ b/frontend/src/i18n/translations/fa.json
+@@ -212,7 +212,8 @@
+     "telegramOsint": "OSINT تلگرام",
+     "strategicRisk": "ریسک راهبردی",
+     "derivedOsint": "OSINT استنتاجی (ریسک راهبردی)",
+-    "derivedOsintSource": "آزمایشی · به‌طور پیش‌فرض غیرفعال"
++    "derivedOsintSource": "آزمایشی · به‌طور پیش‌فرض غیرفعال",
++    "snapmapOsint": "Snap Map activity (zones)"
+   },
+   "gtLean": {
+     "title": "فعال‌سازی OSINT استنتاجی روی یک گره با منابع محدود؟",
+@@ -350,5 +351,19 @@
+     "translatedFrom": "ترجمه‌شده از {lang}",
+     "showOriginal": "نمایش نسخه اصلی ({lang})",
+     "showTranslation": "نمایش ترجمه"
++  },
++  "snapmap": {
++    "level": "Level",
++    "lastHour": "Last hour",
++    "baseline": "Baseline",
++    "warmup": "Calibrating: the baseline builds up over the next scans.",
++    "corroboration": "Corroboration (other layers)",
++    "keywords": "Keywords",
++    "reliabilityHint": "A = analyst-verified · B = corroborated by another source · C = Snap Map only",
++    "confirmPlaceholder": "Verification note (geolocation, source…)",
++    "confirm": "Confirm after verification (A)",
++    "confirmError": "Confirmation failed",
++    "scanned": "Scanned",
++    "disclaimer": "Public snap density — a lead to verify, not an established fact."
+   }
+ }
+diff --git a/frontend/src/i18n/translations/fr.json b/frontend/src/i18n/translations/fr.json
+index e805f03..59148df 100644
+--- a/frontend/src/i18n/translations/fr.json
++++ b/frontend/src/i18n/translations/fr.json
+@@ -212,7 +212,8 @@
+     "telegramOsint": "OSINT Telegram",
+     "strategicRisk": "Carte de risque stratégique",
+     "derivedOsint": "OSINT dérivé (risque stratégique)",
+-    "derivedOsintSource": "Expérimental · désactivé par défaut"
++    "derivedOsintSource": "Expérimental · désactivé par défaut",
++    "snapmapOsint": "Activité Snap Map (zones)"
+   },
+   "gtLean": {
+     "title": "Activer l'OSINT dérivé sur un nœud limité ?",
+@@ -350,5 +351,19 @@
+     "translatedFrom": "Traduit depuis {lang}",
+     "showOriginal": "AFFICHER L'ORIGINAL ({lang})",
+     "showTranslation": "AFFICHER LA TRADUCTION"
++  },
++  "snapmap": {
++    "level": "Niveau",
++    "lastHour": "Dernière heure",
++    "baseline": "Référence",
++    "warmup": "Calibrage en cours : la référence se construit sur les prochains passages.",
++    "corroboration": "Recoupements (autres couches)",
++    "keywords": "Mots-clés",
++    "reliabilityHint": "A = vérifié par un analyste · B = recoupé par une autre source · C = Snap Map seul",
++    "confirmPlaceholder": "Note de vérification (géolocalisation, source…)",
++    "confirm": "Confirmer après vérification (A)",
++    "confirmError": "Échec de la confirmation",
++    "scanned": "Scan il y a",
++    "disclaimer": "Densité de snaps publics — signal à vérifier, pas un fait établi."
+   }
+ }
+diff --git a/frontend/src/i18n/translations/zh-CN.json b/frontend/src/i18n/translations/zh-CN.json
+index 0f72e34..2cdd1b9 100644
+--- a/frontend/src/i18n/translations/zh-CN.json
++++ b/frontend/src/i18n/translations/zh-CN.json
+@@ -212,7 +212,8 @@
+     "telegramOsint": "Telegram OSINT",
+     "strategicRisk": "战略风险热力图",
+     "derivedOsint": "衍生 OSINT（战略风险）",
+-    "derivedOsintSource": "实验功能 · 默认关闭"
++    "derivedOsintSource": "实验功能 · 默认关闭",
++    "snapmapOsint": "Snap Map activity (zones)"
+   },
+   "gtLean": {
+     "title": "在低配节点上启用衍生 OSINT？",
+@@ -350,5 +351,19 @@
+     "translatedFrom": "由 {lang} 翻译",
+     "showOriginal": "显示原文（{lang}）",
+     "showTranslation": "显示译文"
++  },
++  "snapmap": {
++    "level": "Level",
++    "lastHour": "Last hour",
++    "baseline": "Baseline",
++    "warmup": "Calibrating: the baseline builds up over the next scans.",
++    "corroboration": "Corroboration (other layers)",
++    "keywords": "Keywords",
++    "reliabilityHint": "A = analyst-verified · B = corroborated by another source · C = Snap Map only",
++    "confirmPlaceholder": "Verification note (geolocation, source…)",
++    "confirm": "Confirm after verification (A)",
++    "confirmError": "Confirmation failed",
++    "scanned": "Scanned",
++    "disclaimer": "Public snap density — a lead to verify, not an established fact."
+   }
+ }
+diff --git a/frontend/src/lib/layerPreferences.ts b/frontend/src/lib/layerPreferences.ts
+index 71a3a61..c051628 100644
+--- a/frontend/src/lib/layerPreferences.ts
++++ b/frontend/src/lib/layerPreferences.ts
+@@ -58,6 +58,7 @@ export function getDefaultActiveLayers(): ActiveLayers {
+     scm_suppliers: false,
+     cyber_threats: false,
+     telegram_osint: true,
++    snapmap_osint: false,
+     earthquakes: true,
+     firms: false,
+     ukraine_alerts: true,
+diff --git a/frontend/src/types/dashboard.ts b/frontend/src/types/dashboard.ts
+index 552250f..6f325ee 100644
+--- a/frontend/src/types/dashboard.ts
++++ b/frontend/src/types/dashboard.ts
+@@ -970,6 +970,7 @@ export interface DashboardData {
+     timestamp?: string | null;
+     channels?: string[];
+   };
++  snapmap_osint?: SnapmapOsintPayload;
+   gt_risk?: GTRiskPayload;
+ }
+ 
+@@ -1168,6 +1169,73 @@ export interface TelegramOsintPost {
+   embed_url?: string | null;
+ }
+ 
++export type SnapmapLevel = 'unknown' | 'warmup' | 'normal' | 'elevated' | 'high' | 'critical';
++export type SnapmapReliability = 'A' | 'B' | 'C';
++
++export interface SnapmapMediaRef {
++  id: string;
++  time: string;
++  type: 'video' | 'image';
++  url: string | null;
++  locality?: string;
++}
++
++export interface SnapmapCorroboration {
++  layer: string;
++  title: string;
++  distance_km: number;
++}
++
++export interface SnapmapZone {
++  id: string;
++  label: string;
++  lat: number;
++  lng: number;
++  radius_m: number;
++  category?: string;
++  count_24h: number;
++  count_1h: number;
++  baseline_mean: number | null;
++  baseline_std: number | null;
++  baseline_samples?: number;
++  z: number;
++  level: SnapmapLevel;
++  reliability: SnapmapReliability;
++  corroboration: SnapmapCorroboration[];
++  keyword_hits: string[];
++  media: SnapmapMediaRef[];
++  status: 'pending' | 'ok' | 'warmup' | 'error';
++  last_scan: string | null;
++  alert_id?: number;
++}
++
++export interface SnapmapAlert {
++  id: number;
++  zone_id: string;
++  label: string;
++  time: string;
++  level: SnapmapLevel;
++  z: number;
++  count_1h: number;
++  baseline_mean: number | null;
++  reliability: SnapmapReliability;
++  corroboration: SnapmapCorroboration[];
++  confirmed: boolean;
++  analyst_note?: string | null;
++}
++
++export interface SnapmapOsintPayload {
++  zones?: SnapmapZone[];
++  alerts?: SnapmapAlert[];
++  total_zones?: number;
++  anomalies?: number;
++  timestamp?: string | null;
++  interval_minutes?: number;
++  archive_media?: boolean;
++  error?: string | null;
++  source?: string;
++}
++
+ export interface MalwareThreat {
+   id: string;
+   lat: number;
+@@ -1305,6 +1373,7 @@ export interface ActiveLayers {
+   scm_suppliers: boolean;
+   cyber_threats: boolean;
+   telegram_osint: boolean;
++  snapmap_osint: boolean;
+   gt_risk: boolean;
+ }
+ 
